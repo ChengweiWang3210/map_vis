@@ -1,0 +1,581 @@
+---
+title: "Assignment 2"
+output: html_notebook
+---
+
+<style>
+.leaflet {
+    margin: auto;
+}
+</style>
+
+```{r libraries, warning=FALSE, message=FALSE}
+library(data.table)
+library(leaflet)
+library(RColorBrewer)
+library(stringr)
+library(geosphere)
+library(geojsonR)
+library(rgdal)
+library(ggmap)
+library(dplyr)
+library(tidyr)
+library(rgeos)
+library(shiny)
+```
+
+```{r read data, warning=FALSE}
+setwd('/Users/greatyifan/Desktop/@Columbia/2020spring/2_DataViz/course_materials/Exercises/07_fire')
+
+#read in data
+df_fire <- fread('building_fires.csv')
+df_house <- fread('FDNY_Firehouse_Listing.csv')
+```
+
+
+## 1. Location of Severe Fires
+
+```{r data cleaning}
+# levels(df_fire$HIGHEST_LEVEL_DESC)
+# it appears that the levels replicate themselves with with minor description differences, so combine it first.
+df_fire[, HIGHEST_LEVEL_DESC := ifelse(HIGHEST_LEVEL_DESC == "11 - First Alarm", "1 - More than initial alarm, less than Signal 7-5" , HIGHEST_LEVEL_DESC)]
+df_fire[, HIGHEST_LEVEL_DESC := ifelse(HIGHEST_LEVEL_DESC == "22 - Second Alarm", "2 - 2nd alarm" , HIGHEST_LEVEL_DESC)]
+df_fire[, HIGHEST_LEVEL_DESC := ifelse(HIGHEST_LEVEL_DESC == "33 - Third Alarm", "3 - 3rd alarm" , HIGHEST_LEVEL_DESC)]
+df_fire[, HIGHEST_LEVEL_DESC := ifelse(HIGHEST_LEVEL_DESC == "44 - Fourth Alarm", "4 - 4th alarm" , HIGHEST_LEVEL_DESC)]
+df_fire[, HIGHEST_LEVEL_DESC := ifelse(HIGHEST_LEVEL_DESC == "55 - Fifth Alarm", "5 - 5th alarm" , HIGHEST_LEVEL_DESC)]
+df_fire[, HIGHEST_LEVEL_DESC := ifelse(HIGHEST_LEVEL_DESC == "75 - All Hands Working", "7 - Signal 7-5" , HIGHEST_LEVEL_DESC)]
+
+df_fire$HIGHEST_LEVEL_DESC <- factor(df_fire$HIGHEST_LEVEL_DESC)
+
+# cast date-time column into data-time type data
+df_fire$ARRIVAL_DATE_TIME <- as.POSIXct(df_fire$ARRIVAL_DATE_TIME, 
+                                        format = '%m/%d/%Y %I:%M:%S %p') 
+df_fire$INCIDENT_DATE_TIME <- as.POSIXct(df_fire$INCIDENT_DATE_TIME, 
+                                         format = '%m/%d/%Y %I:%M:%S %p')
+
+# attribution to mapbox
+attr <- "© <a href='https://github.com/ChengweiWang3210'>Chengwei Wang</a>"
+
+```
+
+```{r Q1, cache=FALSE, fig.align="center"}
+# set up a base map
+base_map <- leaflet(options = leafletOptions(minZoom = 10, maxZoom = 18)) %>% 
+#fix the zoom level so that zoom out of new york too far is not optional.
+  addTiles(attribution = attr) %>%
+  setView(zoom = 10, lng = -74.00919, lat = 40.69999) %>%
+  addProviderTiles(provider = "CartoDB.VoyagerNoLabels")
+  
+df_highest <- subset(df_fire, df_fire$HIGHEST_LEVEL_DESC == '7 - Signal 7-5')
+
+# add on incident points and popups
+base_map %>%
+  addCircles(data = df_highest,
+             lng = ~lon, lat = ~lat, radius = .1,
+             stroke = .5, color = 'red', fillOpacity = .01, 
+             popup = paste0('Address: ', df_highest$address, '<br/>', 
+                            'Incident Data: ', df_highest$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(df_highest$TOTAL_INCIDENT_DURATION/60),
+                            ' minutes'))
+
+```
+
+
+## 2. Layers and Clusters
+
+### a) Color by Type of Property
+
+```{r dealing property}
+# recategorize property types 
+
+## unique(df_highest$PROPERTY_USE_DESC)[substr(unique(df_highest$PROPERTY_USE_DESC), 1,3 ) < 200]
+## unique(df_highest$PROPERTY_USE_DESC)[substr(unique(df_highest$PROPERTY_USE_DESC), 1,3 ) > 200]
+list_property <- unique(df_highest$PROPERTY_USE_DESC)
+# order of the following codes matters.
+list_property[str_detect(tolower(list_property),'store|shop|club|business|cafe|retail|warehouse|sales|service')] <- 'Business Sphere'
+list_property[str_detect(tolower(list_property), 'doctor|clinic|hospital|recovery|nursing|care|sanita')] <- 'Medical'
+list_property[str_detect(tolower(list_property),'playground|open| 
+|street|terminal|lot|bus|pier|outside|yard|processing|recreation|drinking|parking|shed|construction|distribution|aircraft')] <- 'Open Aera'
+list_property[str_detect(tolower(list_property), 'family|residential,')] <- 'Residence'
+list_property[str_detect(tolower(list_property), 'hotel|dorm|cleaning|storage|shelter|property')] <- 'Dorms, Shelters, Hotels'
+list_property[str_detect(tolower(list_property), 'educ|school')] <- 'Schools'
+list_property[str_detect(tolower(list_property), 'church|hospices|station|arena|assembly|theater|museum|parlor|office|public|bank|hall|disability|studio|center|court|plant|gym|lab|cleaning|storage|property')] <- 'Public 
+'
+list_property[str_detect(tolower(list_property), 'undetermined|none')] <- 'Undefined'
+```
+
+
+```{r combine}
+# combine recoded property categories with original property_use_desc columns
+df_combine <- cbind(unique(df_highest$PROPERTY_USE_DESC), list_property)
+colnames(df_combine) <- c('PROPERTY_USE_DESC', 'property')
+df_combine <- as.data.frame(df_combine)
+```
+
+```{r join property, warning=FALSE}
+# join the recoded property column back to the dataframe
+df_fire_property <- left_join(df_fire, df_combine, by = 'PROPERTY_USE_DESC')
+
+# rank the "property" variable's level by the number of incidents falling into these categories
+ranked <- sort(table(df_fire_property$property), decreasing = T)
+df_fire_property$property <- factor(df_fire_property$property, levels = names(ranked))
+## above 2 lines of code are trying to ranking types of property by their frequency, and use this to show a more imformative legend in the following map. 
+
+```
+
+
+```{r Q2a, cache=FALSE, fig.align="center"}
+# brew the colors for the property variable
+colors <- brewer.pal(uniqueN(df_fire_property$property), "Set2")
+propCol <- colorFactor(colors, df_fire_property$property)
+
+# pick out data with highest level of alarm
+df_highest_property <- subset(df_fire_property, 
+                              df_fire_property$HIGHEST_LEVEL_DESC == '7 - Signal 7-5')
+
+
+base_map %>%
+  addCircles(data = df_highest_property,
+             lng = ~lon, lat = ~lat, radius = 1, color = ~propCol(property),
+             weight = 1, stroke = 1, fillOpacity = .7, 
+             popup = paste0('Address: ', df_highest_property$address, '<br/>', 
+                            'Incident Data: ', df_highest_property$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(df_highest_property$TOTAL_INCIDENT_DURATION/60),
+                            ' minutes<br/>',
+                            'PropertyType: ', df_highest_property$property)) %>%
+  addLegend(data = df_highest_property, group = 'Incidents',
+            title = "Property Types", position = "topleft",
+            pal = propCol, values = ~property)
+```
+
+
+
+### b) Cluster
+
+```{r Q2b, cache=FALSE, fig.align="center"}
+base_map %>%
+  addCircleMarkers(data = df_highest_property,
+             lng = ~lon, lat = ~lat, radius = .1, color = ~propCol(property),
+             stroke = 0, fillOpacity = .9, 
+             popup = paste0('Address: ', df_highest_property$address, '<br/>', 
+                            'Incident Data: ', df_highest_property$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(df_highest_property$TOTAL_INCIDENT_DURATION/60),
+                            ' minutes<br/>',
+                            'PropertyType: ', df_highest_property$property), 
+             clusterOptions = markerClusterOptions(spiderfyOnMaxZoom = 10)) %>%
+  addLegend(data = df_highest_property, group = 'Incidents',
+            title = "Property Types", position = "topleft",
+            pal = propCol, values = ~property)
+```
+
+## 3. Fire Houses
+
+```{r add icon}
+# add on an icon png
+house_icon <- icons(iconUrl = 
+  "/Users/greatyifan/Desktop/@Columbia/2020spring/2_DataViz/assignment/assignment2/house-icon.png",
+                    iconWidth = 8, iconHeight = 8)
+```
+
+
+```{r Q3, warning=FALSE, cache=FALSE, fig.align="center"}
+base_map %>%
+  addCircleMarkers(data = df_highest_property, group = 'Incidents', 
+                   lng = ~lon, lat = ~lat, 
+                   radius = df_highest_property$UNITS_ONSCENE/4,
+                   color = ~propCol(property),
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', df_highest_property$address, '<br/>', 
+                            'Incident Data: ', df_highest_property$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(df_highest_property$TOTAL_INCIDENT_DURATION/60), 
+                            ' minutes<br/>',
+                            'PropertyType: ', df_highest_property$property)) %>%
+  addLegend(data = df_highest_property, group = 'Incidents',
+            pal = propCol, values = ~property, 
+            title = 'Property Types', position = 'topleft') %>%
+  addMarkers(data = df_house, group = 'Firehouses', 
+             lng = ~Longitude, lat = ~Latitude,
+             icon = house_icon, 
+             popup = ~paste0('Address: ', df_house$FacilityAddress, '<br/>', 
+                            'Borough: ', df_house$Borough)) %>%
+  addLayersControl(baseGroups = 'openStreetNYC',
+                   overlayGroups = c('Incidents','Firehouses'), 
+                   options = layersControlOptions(collapsed = T))
+```
+
+## 4. Distance from Firehouse and Response Time
+
+### a) Calculate Distance
+
+```{r calculating distance}
+# this function returns nrow(x) * nrow(y) matrix, where the i-th column indicates the distances between each geopoint in x with the i-th point in y. Similarly, each element in the j-th row means the distance between the j-th point in x with each point in y. In our case, if we want to find out the nearest firehouse for a certain point, we have to find the minimum element for each row, and return the number of column where the minimum point is in, which is the nearest firehouse for that incident. 
+
+mx_dist <- distm(x = matrix(data = c(df_fire$lon, df_fire$lat), ncol = 2),
+      y = matrix(data = c(df_house$Longitude, df_house$Latitude), ncol = 2), 
+      fun = distGeo)
+
+min_dist <- apply(mx_dist, 1, min, na.rm = T)
+
+nearest_house <- apply(mx_dist, 1, function(x)which(x == min(x, na.rm = T)))
+
+# nrow(df_house) # we have 218 fire houses
+
+# summary(nearest_house) # everything seems right
+
+df_fire_property$min_dist <- min_dist
+df_fire_property$nearest_house <- nearest_house
+```
+
+
+```{r get time difference}
+
+df_fire_property$diff_time <- df_fire_property$ARRIVAL_DATE_TIME -
+  df_fire_property$INCIDENT_DATE_TIME
+
+df_fire_property$diff_time <- as.numeric(df_fire_property$diff_time)
+
+```
+
+
+```{r outliers drop}
+# remove outliers, for more informative graphs
+
+## check for the outliers
+head(sort(df_fire_property$min_dist, decreasing  = T)) # one 101812.165 should be removed
+head(sort(df_fire_property$diff_time, decreasing = T)) # two 5339 and 2613 should be removed
+head(sort(df_fire_property$diff_time, decreasing = F)) # one negative number should be removed
+
+df_fire_property <- df_fire_property[-which(df_fire_property$min_dist > 101812.165),]
+df_fire_property <- df_fire_property[-which(df_fire_property$diff_time > 2600),]
+df_fire_property <- df_fire_property[-which(df_fire_property$diff_time < 0),]
+```
+
+```{r Q4a_1, warning=FALSE, message=FALSE, cache=FALSE, fig.align="center"}
+
+ggplot(df_fire_property, aes(x = min_dist, y = diff_time/60)) +
+  geom_point(alpha = .5, color = 'red') + 
+  geom_smooth(method = 'lm', color = 'orange', linetype = 2) +
+  scale_x_log10() +
+  ggthemes::theme_economist_white(gray_bg = F) +
+  ylab("") +
+  scale_y_continuous(expand = c(0, 0)) +
+  xlab("log(distance)") +
+  theme(axis.title.x = element_text(vjust = -3)) +
+  ggtitle(label = "Time Fire Fighters Spent Before Them In the Scene (minutes)")
+
+```
+
+```{r collapsing alarms}
+# minimize the categories of alarms again
+df_fire_property$rescale <- ifelse(df_fire_property$HIGHEST_LEVEL_DESC == '1 - More than initial alarm, less than Signal 7-5' | df_fire_property$HIGHEST_LEVEL_DESC =="0 - Initial alarm",
+                                   "1", df_fire_property$HIGHEST_LEVEL_DESC)
+
+# set this to factor
+df_fire_property$rescale <- factor(df_fire_property$rescale)
+levels(df_fire_property$rescale) <- c("less than 2nd alarm", "2nd alarm", "3rd alarm", 
+                                      "4th alarm ", "5th alarm", "Signal 7-5")
+```
+
+```{r Q4a_2, warning=FALSE, message=FALSE, cache=FALSE, fig.align="center"}
+
+ggplot(subset(df_fire_property, subset = !df_fire_property$rescale %in% NA), 
+       aes(x = min_dist, y = diff_time/60)) +
+  geom_point(alpha = .5, color = 'red') + 
+  geom_smooth(method = 'lm', color = 'orange', linetype = 2) +
+  scale_x_log10() +
+  ggthemes::theme_economist_white(gray_bg = F) +
+  ylab("") +
+  scale_y_continuous(expand = c(0, 0)) +
+  xlab("log(distance)") +
+  theme(axis.title.x = element_text(vjust = -3),
+        title = element_text(vjust = 4), 
+        strip.background = element_rect(fill = "gray"),
+        strip.text = element_text(size = 12)) +
+  ggtitle(label = "Time Fire Fighters Spent Before Them In the Scene (minutes)") +
+  facet_wrap(~ rescale, ) 
+
+  
+```
+
+
+
+### b) Map of Response Times
+
+```{r Q4b1, fig.align="center"}
+
+pal2 <- brewer.pal(uniqueN(df_fire_property$property), "Paired")
+  
+residence <- subset(df_fire_property, df_fire_property$property == "Residence")
+openA <-  subset(df_fire_property, df_fire_property$property == "Open 
+                 ")
+dorm <- subset(df_fire_property, df_fire_property$property == "Dorms, Shelters, Hotels")
+public <- subset(df_fire_property, df_fire_property$property == "Public 
+                 ")
+school <- subset(df_fire_property, df_fire_property$property == "Schools")
+medical <- subset(df_fire_property, df_fire_property$property == "Medical")
+
+
+base_map %>%
+  addCircleMarkers(data = residence, 
+                   group = 'Residence', 
+                   lng = ~lon, lat = ~lat, 
+                   color = pal2[1],
+                   radius = residence$diff_time/100,
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', residence$address, '<br/>', 
+                            'Incident Data: ', residence$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(residence$TOTAL_INCIDENT_DURATION/60), ' min')) %>% 
+  addCircleMarkers(data = openA, 
+                   group = 'Open 
+                   ', 
+                   lng = ~lon, lat = ~lat, 
+                   color = pal2[2],
+                   radius = openA$diff_time/100,
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', openA$address, '<br/>', 
+                            'Incident Data: ', openA$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(openA$TOTAL_INCIDENT_DURATION/60), ' min')) %>% 
+    addCircleMarkers(data = dorm, 
+                   group = 'Dorms, Shelters, Hotels', 
+                   lng = ~lon, lat = ~lat, 
+                   color = pal2[3],
+                   radius = dorm$diff_time/100,
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', dorm$address, '<br/>', 
+                            'Incident Data: ', dorm$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(dorm$TOTAL_INCIDENT_DURATION/60), ' min')) %>% 
+  addCircleMarkers(data = public, 
+                   group = 'Public 
+                   ', 
+                   lng = ~lon, lat = ~lat, 
+                   color = pal2[4],
+                   radius = public$diff_time/100,
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', public$address, '<br/>', 
+                            'Incident Data: ', public$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(public$TOTAL_INCIDENT_DURATION/60), ' min')) %>% 
+  addCircleMarkers(data = school, 
+                   group = 'Schools', 
+                   lng = ~lon, lat = ~lat, 
+                   color = pal2[5],
+                   radius = school$diff_time/100,
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', school$address, '<br/>', 
+                            'Incident Data: ', school$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(school$TOTAL_INCIDENT_DURATION/60), ' min')) %>% 
+  addCircleMarkers(data = medical, 
+                   group = 'Medical', 
+                   lng = ~lon, lat = ~lat, 
+                   color = pal2[6],
+                   radius = medical$diff_time/100,
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', medical$address, '<br/>', 
+                            'Incident Data: ', medical$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(medical$TOTAL_INCIDENT_DURATION/60), ' min')) %>% 
+  addLayersControl(overlayGroups = c('Residence','Open 
+                                     ',
+                                     'Dorms, Shelters, Hotels', 'Public 
+                                     ',
+                                     'Medical','Schools'),
+                   options = layersControlOptions(collapsed = F), 
+                   position = "topleft") 
+  
+```
+
+It is really hard to compare the response time among various types of property only by color and size, so I use the checkbox feature in the layers control to make it easier for readers to compare by checking different kinds of property. 
+
+
+```{r Q4a_highestLevel_respons, fig.align="center"}
+levels(df_fire_property$HIGHEST_LEVEL_DESC)[2] <- "1 - More than initial alarm"
+
+pal2 <- brewer.pal(uniqueN(df_fire_property[!df_fire_property$HIGHEST_LEVEL_DESC %in% NA, ]$HIGHEST_LEVEL_DESC), 
+                   'YlOrRd')
+propCol2 <- colorFactor(palette = pal2, domain = df_fire_property$HIGHEST_LEVEL_DESC)
+
+base_map %>%
+  addCircleMarkers(data = df_fire_property[!df_fire_property$HIGHEST_LEVEL_DESC %in% NA, ], 
+                   group = 'Incidents', 
+                   lng = ~lon, lat = ~lat, 
+                   radius = df_fire_property$diff_time/100,
+                   color = ~propCol2(HIGHEST_LEVEL_DESC),
+                   stroke = 0, weight = 0, fillOpacity = .7, 
+                   popup = ~paste0('Address: ', df_fire_property$address, '<br/>', 
+                            'Incident Data: ', df_fire_property$INCIDENT_DATE_TIME, '<br/>',
+                            'Total Incident Duration: ',
+                            round(df_fire_property$TOTAL_INCIDENT_DURATION/60), ' min<br/>',
+                            'PropertyType: ', df_fire_property$property)) %>%
+  addLegend(data = df_fire_property[!df_fire_property$HIGHEST_LEVEL_DESC %in% NA, ], 
+            group = 'Incidents',
+            pal = propCol2, values = ~HIGHEST_LEVEL_DESC, 
+            title = 'Level of Alarms', position = 'topleft')
+
+```
+
+
+```{r read geojson, message=FALSE, }
+nyc <- readOGR('/Users/greatyifan/Desktop/@Columbia/2020spring/2_DataViz/course_materials/Exercises/07_fire/borough_boundaries.geojson')
+```
+
+```{r add data on polygon}
+df_fire_property$year <- year(df_fire_property$ARRIVAL_DATE_TIME)
+
+df_fire_property$boro_name <- gsub('\\d{1}\\s-\\s', '', df_fire_property$BOROUGH_DESC)
+df_fire_property$year <- paste0("n_", df_fire_property$year) #avoiding valuable names is number
+
+boro_year_count <- df_fire_property %>% 
+  group_by(year, boro_name) %>% 
+  count() %>% 
+  drop_na() %>% 
+  spread(key = 'year', value = 'n')
+
+```
+
+```{r join data, warning=FALSE, message=FALSE}
+nyc@data <- nyc@data %>% 
+  left_join(boro_year_count, on = "boro_name")
+```
+
+```{r boro centroid}
+# get centroid for each borough
+centers <- as.data.frame(gCentroid(nyc, byid = T))
+```
+
+```{r set pal for following maps}
+pal_year <- colorBin("YlOrRd", bins = seq(from = 0, to = 900, by = 100))
+```
+
+```{r map2013}
+
+map_2013 <- base_map %>% 
+  addPolygons(data = nyc, stroke = FALSE, smoothFactor = 0.5,
+              weight=1, color='#333333', opacity=1,
+              fillColor = ~pal_year(n_2013),
+              fillOpacity = .8) %>% 
+  addLegend(data = nyc@data, pal = pal_year, position = "topleft", 
+            values = ~n_2013, title = "<font size='5'>2013</font>") %>% 
+  addLabelOnlyMarkers(lng = centers[,1], lat = centers[,2], 
+                      label = paste0(nyc@data$boro_name, "\n", nyc@data$n_2013),
+                      labelOptions = labelOptions(noHide = T, textOnly = T, 
+                                                  direction = 'center'))
+
+
+```
+
+
+```{r map2014}
+
+map_2014 <- base_map %>% 
+  addPolygons(data = nyc, stroke = FALSE, smoothFactor = 0.5,
+              weight=1, color='#333333', opacity=1,
+              fillColor = ~pal_year(n_2014),
+              fillOpacity = .8) %>% 
+  addLegend(data = nyc@data, pal = pal_year, position = "topleft", 
+            values = ~n_2014, title = "<font size='5'>2014</font>") %>% 
+  addLabelOnlyMarkers(lng = centers[,1], lat = centers[,2], 
+                      label = paste0(nyc@data$boro_name, "\n", nyc@data$n_2014),
+                      labelOptions = labelOptions(noHide = T, textOnly = T, 
+                                                  direction = 'center'))
+
+```
+
+```{r map2015}
+
+map_2015 <- base_map %>% 
+  addPolygons(data = nyc, stroke = FALSE, smoothFactor = 0.5,
+              weight=1, color='#333333', opacity=1,
+              fillColor = ~pal_year(n_2015),
+              fillOpacity = .8) %>% 
+  addLegend(data = nyc@data, pal = pal_year, position = "topleft", 
+            values = ~n_2015, title = "<font size='5'>2015</font>") %>% 
+  addLabelOnlyMarkers(lng = centers[,1], lat = centers[,2], 
+                      label = paste0(nyc@data$boro_name, "\n", nyc@data$n_2015),
+                      labelOptions = labelOptions(noHide = T, textOnly = T, 
+                                                  direction = 'center'))
+
+```
+
+```{r map2016}
+
+map_2016 <- base_map %>% 
+  addPolygons(data = nyc, stroke = FALSE, smoothFactor = 0.5,
+              weight=1, color='#333333', opacity=1,
+              fillColor = ~pal_year(n_2016),
+              fillOpacity = .8) %>% 
+  addLegend(data = nyc@data, pal = pal_year, position = "topleft", 
+            values = ~n_2016, title = "<font size='5'>2016</font>") %>% 
+  addLabelOnlyMarkers(lng = centers[,1], lat = centers[,2], 
+                      label = paste0(nyc@data$boro_name, "\n", nyc@data$n_2016),
+                      labelOptions = labelOptions(noHide = T, textOnly = T, 
+                                                  direction = 'center'))
+
+```
+
+```{r map2017}
+
+map_2017 <- base_map %>% 
+  addPolygons(data = nyc, stroke = FALSE, smoothFactor = 0.5,
+              weight=1, color='#333333', opacity=1,
+              fillColor = ~pal_year(n_2017),
+              fillOpacity = .8) %>% 
+  addLegend(data = nyc@data, pal = pal_year, position = "topleft", 
+            values = ~n_2017, title = "<font size='5'>2017</font>") %>% 
+  addLabelOnlyMarkers(lng = centers[,1], lat = centers[,2], 
+                      label = paste0(nyc@data$boro_name, "\n", nyc@data$n_2017),
+                      labelOptions = labelOptions(noHide = T, textOnly = T, 
+                                                  direction = 'center'))
+
+```
+
+```{r map2018}
+
+map_2018 <- base_map %>% 
+  addPolygons(data = nyc, stroke = FALSE, smoothFactor = 0.5,
+              weight=1, color='#333333', opacity=1,
+              fillColor = ~pal_year(n_2018),
+              fillOpacity = .8) %>% 
+  addLegend(data = nyc@data, pal = pal_year, position = "topleft", 
+            values = ~n_2018, title = "<font size='5'>2018</font>") %>% 
+  addLabelOnlyMarkers(lng = centers[,1], lat = centers[,2], 
+                      label = paste0(nyc@data$boro_name, "\n", nyc@data$n_2018),
+                      labelOptions = labelOptions(noHide = T, textOnly = T, 
+                                                  direction = 'center'))
+
+```
+
+```{r Q4_b3, eval=FALSE}
+leaflet_grid <- 
+  tagList(
+    tags$table(width = "100%",
+               tags$tr(
+                 tags$td(map_2013),
+                 tags$td(map_2014)
+               ),
+               tags$tr(
+                 tags$td(map_2015),
+                 tags$td(map_2016)
+               ),
+               tags$tr(
+                 tags$td(map_2017),
+                 tags$td(map_2018)
+               )
+    )
+  )
+
+browsable(leaflet_grid)
+```
+
+
+
+
+
+
